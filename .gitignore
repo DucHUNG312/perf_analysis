@@ -1,0 +1,263 @@
+book/
+third_party/TransformerEngine-src/
+third_party/wheels/
+third_party/cutlass/
+artifacts_tmp/
+.cuda_env/
+file_inventory.csv
+third_party/wheels/torch-*.whl
+third_party/wheels/transformer_engine-*.whl
+third_party/wheels/flash_attn*.whl
+third_party/wheels/vllm*.whl
+third_party/vllm-src/
+third_party/te_sm100a_env.sh
+.env
+.env.local
+.env.bak
+report.html
+mcp_tools_test_report.md
+core/artifacts/ 
+.hypothesis/
+artifacts_chXX/
+benchmark_profiles_chXX/
+config/.env
+config/.env.local
+benchmark_test_results.json
+benchmark_test_results.md
+benchmark_status_table.json
+benchmark_status_table.txt
+benchmark_results/
+checkpoints/
+benchmark_test_results.md
+.torch_inductor/
+review_issues.json
+tmp_bench/
+results_all/
+results_ch1/
+results_ch20/
+synthetic_moe_results.json
+accuracy_test_results_*/
+tmp_bench_ch20/
+tmp_results/
+tmp_profiles/
+tmp_profile_*/
+tmp_bench_*/
+tmp_*/
+gpt-oss-20b/
+mixtral-8x7b/
+phi-3.5-moe/
+.kiro/
+*-plan.md
+benchmark_peak_results_*.json
+benchmark_peak_manifest_*.json
+benchmark_profiles/
+benchmark_results_*.json
+benchmark_results_*.json
+benchmark_test_results_*.json
+benchmark_test_results_*.json
+DUPLICATE_ANALYSIS.md
+HIGH_PRIORITY_DUPLICATES.md
+DUPLICATE_ANALYSIS_UPDATED.md
+proof_of_benefit.csv
+reports/
+tmp*.py
+artifacts_tmp*.json
+artifacts_tmp*.pid
+comparison_*.html
+profile_captures/
+
+core/benchmark/blackwell_optimizations/blackwell_optimizations/test_all_features
+core/benchmark/blackwell_optimizations/blackwell_optimizations/test_clusters
+core/benchmark/blackwell_optimizations/blackwell_optimizations/test_dsmem
+core/benchmark/blackwell_optimizations/blackwell_optimizations/test_fp8
+core/benchmark/blackwell_optimizations/blackwell_optimizations/test_tma
+core/benchmark/blackwell_optimizations/blackwell_optimizations/test_tmem
+core/benchmark/blackwell_optimizations/blackwell_optimizations/test_warp_spec
+ch19/baseline_fp4_hardware_kernel
+ch19/optimized_fp4_hardware_kernel
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# CUDA compiled binaries
+*_sm100
+*_sm121
+*.o
+*.so
+*.a
+*.cubin
+*.fatbin
+*.ptx
+
+# Profiling outputs
+profiles/
+profiles_*/
+profiling_results/
+profiling_results_*/
+profiling_results_new/
+ch*/profiling_results/
+code/profiles/
+example_profiling/
+profile_runs/
+ch*/*_pytorch_profile/
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.qdrep
+nsys_profile_*
+ncu_profile_*
+hta_profile_*
+perf.data
+perf.data_*
+comprehensive_*
+*.pt.trace.json
+ch*/hta_traces/
+# Allow curated profiling captures for review/commit
+!profile_captures/
+!profile_captures/**
+!profile_captures/**/*.nsys-rep
+!profile_captures/**/*.ncu-rep
+!profile_captures/**/*.qdrep
+!profile_captures/**/*.sqlite
+
+# Test and benchmark results
+benchmark_results/
+*/benchmark_results/
+test_results/
+test_results_*/
+quick_test_results/
+quick_test_results_*.tar.gz
+all_chapters_results/
+all_chapters_results_*/
+validation_results/
+validation_results_*/
+quick_load_test_validation/
+
+# Root-level benchmark and performance result files
+all_results.json
+all_results_output.txt
+performance_results.json
+performance_summary.txt
+final_benchmark_results.txt
+final_benchmark_run.log
+BENCHMARK_PEAK_RESULTS_*.json
+single_gpu_load_test.json
+
+# Generated summary files
+*summary.md
+**/summary.md
+
+# Expectations backups
+*.json.bak
+
+# LLM-generated analysis outputs
+llm_analysis/
+**/llm_analysis/
+llm_patches/
+**/llm_patches/
+**/llm_analysis/
+llm_patches_test/
+**/llm_patches_test/
+llm_explanations/
+**/llm_explanations/
+
+# Power and performance metrics
+power_results/
+power_metrics/
+quick_power_test/
+power_baseline*.json
+nvlink_bandwidth_test.json
+large_model_eager_8xb200*.json
+
+# PyTorch compile caches
+.torch_inductor/
+.torch_extensions/
+compiled_code_output/
+torch_compile_debug/
+
+# Build and run artifacts
+artifacts/*
+!artifacts/golden/
+artifacts/20*/
+ch*/*_build.log
+ch*/*_profile.log
+ch*/*_benchmark.log
+ch*/*_output.log
+*_build.log
+*_profile.log
+*_benchmark.log
+
+# Chapter-specific generated files
+ch*/*_trace.json
+ch*/*_snapshot.json
+ch*/synthetic_moe_results.json
+
+# Log files
+*.log
+cufile.log
+quick_retest.log
+benchmark_run.log
+final_benchmark.log
+
+# Generated plots and outputs (in chapter directories)
+ch*/roofline_plot.png
+ch*/*.png
+ch*/*.svg
+
+# Chapter NVCC build products (extensionless executables)
+# Match extensionless executables but exclude source files and config files
+ch*/*_sm[0-9]*
+ch*/*_sm[0-9][0-9]*
+# Test executables (manually compiled test programs)
+ch*/test_*
+# Build targets without architecture suffix (base names)
+ch*/warp_spec_cluster_test
+ch*/warp_specialized_cluster_pipeline_multistream
+ch*/warp_specialized_two_pipelines_multistream
+# Explicitly allow Python and CUDA source files
+!ch*/*.py
+!ch*/*.cu
+!ch*/Makefile
+
+# Third-party downloads
+third_party/cutlass/
+third_party/llvm/
+!ch*/README.md
+!ch*/arch_config.py
+!ch*/compare.py
+
+# NFS files
+.nfs*
+
+# Bootcamp game data (player-specific)
+bootcamp/data/game_state.json
+bootcamp/data/*.json
+!bootcamp/data/.gitkeep
+
+# Generated evaluation datasets (keep README, ignore data files)
+eval_datasets/*.txt
+eval_datasets/*.json
+!eval_datasets/README.md
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Node / frontend
+node_modules/
+dashboard/web/.next/
+dashboard/web/.turbo/
