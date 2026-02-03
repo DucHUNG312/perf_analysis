@@ -1,0 +1,109 @@
+# AI Performance Engineering - Blackwell Requirements
+# Target: Blackwell B200/B300 (SM100) with PyTorch 2.10-dev (cu130 nightly), CUDA 13.0, Triton 3.5.0
+# All versions are pinned to exact versions for reproducible builds
+
+# Core PyTorch ecosystem (CUDA 13 nightly wheels)
+#-f ./third_party/wheels
+# --index-url https://download.pytorch.org/whl/nightly/cu130
+# torch is installed by setup.sh from the cached nightly wheel; omit here to avoid duplicate installs
+# torchvision will be installed separately with --no-deps to prevent torch override
+
+# Optional: install upstream Triton if you author custom GPU kernels outside of
+triton==3.5.0
+
+# Build tooling compatibility
+packaging==25.0
+ninja==1.13.0
+nvidia-mathdx==25.6.0
+
+# Monitoring and system insight
+nvidia-ml-py==12.560.30
+psutil==7.1.0
+GPUtil==1.4.0
+py-cpuinfo==9.0.0
+
+# Data processing stack
+numpy==2.1.2
+pandas==2.3.2
+scikit-learn==1.7.2
+pillow==11.3.0
+
+# Visualization & reporting
+matplotlib==3.10.6
+seaborn==0.13.2
+tensorboard==2.20.0
+wandb==0.22.0
+plotly==6.3.0
+bokeh==3.8.0
+dash==3.2.0
+
+# Storage I/O bindings (GPUDirect Storage)
+cuda-python
+kvikio-cu12
+
+# CUTLASS backend for torch.compile (includes Python API and C++ headers)
+nvidia-cutlass-dsl==4.3.4   
+
+# Development workflow
+jupyter==1.1.1
+ipykernel==6.30.1
+black==25.9.0
+isort==5.13.2
+ruff==0.8.4
+flake8==7.3.0
+mypy==1.18.2
+pre-commit==4.0.1
+pytest==8.3.4
+hypothesis==6.148.2  # Property-based testing for benchmark integrity tests
+pyyaml==6.0.2
+pydantic==2.12.4
+pydantic-core==2.41.5  # Required by pydantic 2.12.4
+typer==0.12.0
+typer-slim[standard]==0.12.0  # Required by typer 0.12.0 and typer-cli 0.12.0
+click==8.1.7  # Pin to Typer-compatible Click to avoid CLI help/runtime errors
+rich==13.7.0
+
+# Dashboard API server
+fastapi==0.121.3
+uvicorn==0.38.0
+httpx==0.28.1
+
+# Model development helpers
+transformers==4.56.0
+datasets==2.21.0
+accelerate==0.29.0
+sentencepiece==0.2.0
+tokenizers==0.22.2
+# Pin dependencies to prevent conflicts
+huggingface-hub==0.34.6  # Required by transformers 4.56.0 and tokenizers 0.22.2
+
+# Optional model serving & optimization
+torchtitan==0.2.0
+flashinfer-python==0.6.2
+ordered-set==4.1.0
+
+# GPU compression & pipeline helpers
+
+# Profiling & diagnostics
+py-spy==0.4.1
+memory-profiler==0.61.0
+line-profiler==5.0.0
+pyinstrument==5.1.1
+snakeviz==2.2.2
+
+# Experiment management & search
+optuna==4.5.0
+hyperopt==0.2.7
+ray==2.49.2
+
+# Scalable data utilities
+dask==2025.9.1
+xarray==2025.6.1
+fsspec[http]==2024.6.1
+pydantic
+
+# Notes
+# - Install DeepSpeed/Fairscale or other distributed frameworks separately as needed
+# - Ensure CUDA 13 toolkit/driver is present on systems building custom extensions
+# - ruff is preferred over flake8, but flake8 is kept for compatibility
+# - fsspec[http] version kept compatible with datasets 2.21.0

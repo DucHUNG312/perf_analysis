@@ -53,26 +53,32 @@ def _configure_compiler_defaults() -> None:
         try:
             cuda_cfg.enable_tma = True
         except Exception:
-            logger.warning("Failed to enable TMA via torch.compiler.config.cuda.enable_tma", exc_info=True)
+            logger.warning(
+                "Failed to enable TMA via torch.compiler.config.cuda.enable_tma", exc_info=True)
 
     triton_cfg = getattr(config, "triton", None)
     if triton_cfg is None:
-        logger.debug("torch.compiler.config.triton is unavailable; Triton defaults unchanged.")
+        logger.debug(
+            "torch.compiler.config.triton is unavailable; Triton defaults unchanged.")
         return
     if hasattr(triton_cfg, "tma_support"):
         try:
             triton_cfg.tma_support = True
         except Exception:
-            logger.warning("Failed to enable Triton TMA support via compiler.config", exc_info=True)
+            logger.warning(
+                "Failed to enable Triton TMA support via compiler.config", exc_info=True)
     else:
-        logger.debug("torch.compiler.config.triton.tma_support is unavailable; leaving default.")
+        logger.debug(
+            "torch.compiler.config.triton.tma_support is unavailable; leaving default.")
     if hasattr(triton_cfg, "autotune_mode"):
         try:
             triton_cfg.autotune_mode = "max-autotune"
         except Exception:
-            logger.warning("Failed to set Triton autotune_mode=max-autotune", exc_info=True)
+            logger.warning(
+                "Failed to set Triton autotune_mode=max-autotune", exc_info=True)
     else:
-        logger.debug("torch.compiler.config.triton.autotune_mode is unavailable; leaving default.")
+        logger.debug(
+            "torch.compiler.config.triton.autotune_mode is unavailable; leaving default.")
     # Also set unique_kernel_names on compiler.config.triton if available
     if hasattr(triton_cfg, "unique_kernel_names"):
         try:
@@ -143,25 +149,27 @@ def _mirror_legacy_tf32_flags(enable_matmul: bool, enable_cudnn: bool) -> None:
     """
     # These attributes may not exist in older PyTorch versions
     if hasattr(torch.backends.cuda, 'matmul') and hasattr(torch.backends.cuda.matmul, 'allow_tf32'):
-        torch.backends.cuda.matmul.allow_tf32 = enable_matmul  # type: ignore[attr-defined]
+        # type: ignore[attr-defined]
+        torch.backends.cuda.matmul.allow_tf32 = enable_matmul
     if hasattr(torch.backends, 'cudnn') and hasattr(torch.backends.cudnn, 'allow_tf32'):
-        torch.backends.cudnn.allow_tf32 = enable_cudnn  # type: ignore[attr-defined]
+        # type: ignore[attr-defined]
+        torch.backends.cudnn.allow_tf32 = enable_cudnn
 
 
 def get_optimal_compile_mode(preferred_mode: str = "max-autotune", sm_threshold: int = 68) -> str:
     """
     Get the optimal torch.compile mode based on GPU SM count.
-    
+
     max-autotune requires >= 68 SMs (Streaming Multiprocessors) for GEMM operations.
     GPUs with fewer SMs will fall back to reduce-overhead to avoid warnings.
-    
+
     Parameters
     ----------
     preferred_mode:
         The preferred compile mode (default: "max-autotune")
     sm_threshold:
         Minimum number of SMs required for max-autotune (default: 68)
-    
+
     Returns
     -------
     str
@@ -170,14 +178,15 @@ def get_optimal_compile_mode(preferred_mode: str = "max-autotune", sm_threshold:
     """
     if preferred_mode != "max-autotune":
         return preferred_mode
-    
+
     if not torch.cuda.is_available():
         return "reduce-overhead"
-    
+
     try:
         device_index = torch.cuda.current_device()
-        num_sms = torch.cuda.get_device_properties(device_index).multi_processor_count
-        
+        num_sms = torch.cuda.get_device_properties(
+            device_index).multi_processor_count
+
         if num_sms >= sm_threshold:
             return "max-autotune"
         else:
@@ -231,18 +240,22 @@ def maybe_nested_compile_region(fn: _CallableT) -> _CallableT:
 def _get_torch_compile() -> Callable[..., Any]:
     compile_fn = getattr(torch, "compile", None)
     if compile_fn is None:  # pragma: no cover - depends on PyTorch build
-        raise RuntimeError("SKIPPED: torch.compile is unavailable in this PyTorch build.")
+        raise RuntimeError(
+            "SKIPPED: torch.compile is unavailable in this PyTorch build.")
     return compile_fn
 
 
-_ALLOWED_COMPILE_KWARGS = {"fullgraph", "dynamic", "backend", "options", "disable"}
+_ALLOWED_COMPILE_KWARGS = {"fullgraph",
+                           "dynamic", "backend", "options", "disable"}
 
 
 def _normalize_compile_kwargs(kwargs: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
-    extra: Dict[str, Any] = dict(kwargs)  # defensive copy so callers can reuse dicts
+    # defensive copy so callers can reuse dicts
+    extra: Dict[str, Any] = dict(kwargs)
     preferred_mode = extra.pop("mode", "max-autotune")
     chosen_mode = get_optimal_compile_mode(preferred_mode)
-    filtered = {key: value for key, value in extra.items() if key in _ALLOWED_COMPILE_KWARGS}
+    filtered = {key: value for key,
+                value in extra.items() if key in _ALLOWED_COMPILE_KWARGS}
     return chosen_mode, filtered
 
 
@@ -275,7 +288,7 @@ def compile_model(module: torch.nn.Module, **kwargs: Any) -> torch.nn.Module:
     Parameters follow the historical signature used throughout the chapters.
     Unknown keyword arguments are ignored intentionally to preserve backwards
     compatibility with chapter-specific wrappers.
-    
+
     FAIL FAST: If compilation fails, we raise an error with "SKIPPED:" prefix
     so the benchmark harness properly skips the benchmark. We do NOT silently
     fall back to eager mode - that would produce invalid benchmark results.
@@ -294,39 +307,44 @@ def compile_model(module: torch.nn.Module, **kwargs: Any) -> torch.nn.Module:
             except Exception:
                 major_minor = None
         major = major_minor[0] if major_minor else None
-        
+
         # Identify known torch.compile issues - SKIP (don't silently fallback!)
         # These are hardware/toolchain limitations, not code bugs
         skip_reasons = []
-        
+
         if "NoTritonConfigsError" in message:
             skip_reasons.append("Triton has no valid configs for this kernel")
         if "ptxas fatal" in message:
-            skip_reasons.append("PTX assembler error (toolchain incompatibility)")
+            skip_reasons.append(
+                "PTX assembler error (toolchain incompatibility)")
         if "sm_121" in message:
-            skip_reasons.append("SM 12.1 (Blackwell) not supported by current Triton")
+            skip_reasons.append(
+                "SM 12.1 (Blackwell) not supported by current Triton")
         if major is not None and major >= 12:
-            skip_reasons.append(f"SM {major}.x architecture not fully supported")
-        
+            skip_reasons.append(
+                f"SM {major}.x architecture not fully supported")
+
         # These indicate code bugs that should be FIXED, not skipped
         # But we still skip with clear error so developer knows to fix
         if "SymNodeVariable" in message:
-            skip_reasons.append("SymNodeVariable bug - symbolic tracing incompatible (FIX THE CODE)")
+            skip_reasons.append(
+                "SymNodeVariable bug - symbolic tracing incompatible (FIX THE CODE)")
         if "SymInt" in message and "cannot be" in message:
             skip_reasons.append("Dynamic shape tracing issue (FIX THE CODE)")
         if "Unsupported: call_function aten" in message:
-            skip_reasons.append("Unsupported aten operation in torch.compile (FIX THE CODE)")
-        
+            skip_reasons.append(
+                "Unsupported aten operation in torch.compile (FIX THE CODE)")
+
         if skip_reasons:
             reason_str = "; ".join(skip_reasons)
             raise RuntimeError(
                 f"SKIPPED: torch.compile failed - {reason_str}. "
                 f"Original error: {message[:200]}"
             ) from exc
-        
+
         # Unknown error - re-raise as-is
         raise
-    
+
     setattr(compiled, "_is_compiled_benchmark_module", True)
     return compiled
 
@@ -523,13 +541,13 @@ def _supported_arch_aliases(major: int, minor: int) -> Tuple[str, ...]:
 def is_torch_compile_supported_on_device(device_index: Optional[int] = None) -> Tuple[bool, Optional[str]]:
     """
     Determine if torch.compile has kernel support for the active CUDA architecture.
-    
+
     Returns (True, None) when the architecture is baked into the current PyTorch build,
     otherwise (False, reason) describing the capability gap.
     """
     if not torch.cuda.is_available():
         return True, None
-    
+
     try:
         if device_index is None:
             if getattr(torch.cuda, "_initialized", False):
@@ -539,15 +557,16 @@ def is_torch_compile_supported_on_device(device_index: Optional[int] = None) -> 
         major, minor = torch.cuda.get_device_capability(device_index)
     except Exception as exc:  # pragma: no cover - depends on runtime
         return False, f"torch.compile: unable to query CUDA capability ({exc})."
-    
+
     supported_arches = _get_compiled_architectures()
     aliases = _supported_arch_aliases(major, minor)
     for alias in aliases:
         if alias in supported_arches:
             return True, None
-    
+
     arch_display = _format_arch(major, minor)
-    supported_display = ", ".join(supported_arches) if supported_arches else "unknown"
+    supported_display = ", ".join(
+        supported_arches) if supported_arches else "unknown"
     reason = (
         f"GPU {arch_display} (compute capability {major}.{minor}) is missing from the "
         f"PyTorch {torch.__version__} SASS list [{supported_display}]."
@@ -581,7 +600,7 @@ def _make_tls_default(attr_name: str) -> Optional[Any]:
 def _patch_cudagraph_tls_bug() -> None:
     """
     Work around a PyTorch TLS regression on newly added architectures (e.g. SM12.1).
-    
+
     When CUDA graph trees try to read thread-local state before the Inductor module
     has stashed the default dictionaries, an assertion is raised. We defensively
     recreate the missing structures and stash them so later reads succeed.
@@ -593,7 +612,8 @@ def _patch_cudagraph_tls_bug() -> None:
     try:
         trees = importlib.import_module("torch._inductor.cudagraph_trees")
     except Exception as exc:  # pragma: no cover - safety path
-        logger.debug("Unable to import torch._inductor.cudagraph_trees: %s", exc)
+        logger.debug(
+            "Unable to import torch._inductor.cudagraph_trees: %s", exc)
         return
 
     original_get_obj = getattr(trees, "get_obj", None)
@@ -616,8 +636,10 @@ def _patch_cudagraph_tls_bug() -> None:
         try:
             torch._C._stash_obj_in_tls(attr_name, fallback)
         except Exception:
-            logger.debug("Unable to stash TLS object for %s", attr_name, exc_info=True)
-        _log_once(f"Rebuilt missing CUDA graph TLS bucket '{attr_name}' to avoid torch.compile crashes.")
+            logger.debug("Unable to stash TLS object for %s",
+                         attr_name, exc_info=True)
+        _log_once(
+            f"Rebuilt missing CUDA graph TLS bucket '{attr_name}' to avoid torch.compile crashes.")
         return fallback
 
     trees.get_obj = patched_get_obj  # type: ignore[assignment]
