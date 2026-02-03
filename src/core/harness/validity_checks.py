@@ -1,0 +1,1779 @@
+"""Benchmark Validity Checks.
+
+This module provides utilities to detect and prevent benchmark validity issues
+that could lead to misleading performance measurements.
+
+Categories covered:
+- Memory manipulation (aliasing, pre-allocation)
+- Work relocation (setup pre-computation, lazy evaluation)
+- Environment issues (GPU state, GC interference)
+- Compilation issues (cache, recompilation)
+
+"""
+
+from __future__ import annotations
+
+import gc
+import hashlib
+import os
+import re
+import statistics
+import sys
+import warnings
+from contextlib import contextmanager
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore
+
+
+# =============================================================================
+# GPU State Monitoring
+# =============================================================================
+
+@dataclass
+class GPUState:
+    """Snapshot of GPU state for validity checking."""
+    device_index: int
+    device_name: str
+    temperature_c: Optional[float] = None
+    clock_mhz: Optional[int] = None
+    memory_clock_mhz: Optional[int] = None
+    power_draw_w: Optional[float] = None
+    memory_used_mb: Optional[float] = None
+    memory_total_mb: Optional[float] = None
+    throttle_reason: Optional[str] = None
+
+
+def capture_gpu_state(device_index: int = 0) -> GPUState:
+    """Capture current GPU state for comparison.
+    """
+    if torch is None or not torch.cuda.is_available():
+        return GPUState(device_index=device_index, device_name="N/A")
+    
+    props = torch.cuda.get_device_properties(device_index)
+    state = GPUState(
+        device_index=device_index,
+        device_name=props.name,
+    )
+
+    state.memory_used_mb = torch.cuda.memory_allocated(device_index) / (1024 * 1024)
+    state.memory_total_mb = props.total_memory / (1024 * 1024)
+
+    try:
+        import pynvml
+    except ImportError as exc:
+        raise RuntimeError(
+            "capture_gpu_state requires pynvml (nvidia-ml-py) when CUDA is available."
+        ) from exc
+
+    # Collect detailed state via NVML (fail-fast on any NVML error).
+    pynvml.nvmlInit()
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+
+        state.temperature_c = float(
+            pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+        )
+
+        state.clock_mhz = int(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM))
+        state.memory_clock_mhz = int(
+            pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+        )
+
+        state.power_draw_w = float(pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0)
+
+        throttle = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)
+        if throttle != 0:
+            reasons = []
+            if throttle & 0x1:
+                reasons.append("GpuIdle")
+            if throttle & 0x2:
+                reasons.append("ApplicationsClocks")
+            if throttle & 0x4:
+                reasons.append("SwPowerCap")
+            if throttle & 0x8:
+                reasons.append("HwSlowdown")
+            if throttle & 0x10:
+                reasons.append("SyncBoost")
+            if throttle & 0x20:
+                reasons.append("SwThermalSlowdown")
+            if throttle & 0x40:
+                reasons.append("HwThermalSlowdown")
+            if throttle & 0x80:
+                reasons.append("HwPowerBrakeSlowdown")
+            state.throttle_reason = ",".join(reasons) if reasons else None
+    finally:
+        pynvml.nvmlShutdown()
+    
+    return state
+
+
+def check_gpu_state_consistency(before: GPUState, after: GPUState, 
+                                  temp_threshold: float = 10.0,
+                                  clock_threshold_pct: float = 10.0) -> Tuple[bool, List[str]]:
+    """Check if GPU state changed significantly during benchmark.
+    
+    Returns:
+        Tuple of (is_consistent, list_of_warnings)
+    """
+    warnings_list: List[str] = []
+    
+    # Temperature increase
+    if before.temperature_c is not None and after.temperature_c is not None:
+        temp_delta = after.temperature_c - before.temperature_c
+        if temp_delta > temp_threshold:
+            warnings_list.append(
+                f"GPU temperature increased {temp_delta:.1f}°C during benchmark "
+                f"({before.temperature_c}°C → {after.temperature_c}°C)"
+            )
+    
+    # Clock speed drop
+    if before.clock_mhz is not None and after.clock_mhz is not None:
+        clock_drop_pct = (before.clock_mhz - after.clock_mhz) / before.clock_mhz * 100
+        if clock_drop_pct > clock_threshold_pct:
+            warnings_list.append(
+                f"GPU clock dropped {clock_drop_pct:.1f}% during benchmark "
+                f"({before.clock_mhz}MHz → {after.clock_mhz}MHz) - possible thermal throttling"
+            )
+    
+    # Throttling detected
+    if after.throttle_reason and "Thermal" in after.throttle_reason:
+        warnings_list.append(f"GPU throttling detected: {after.throttle_reason}")
+    
+    return len(warnings_list) == 0, warnings_list
+
+
+# =============================================================================
+# Backend Precision Policy Guard
+# =============================================================================
+
+@dataclass(frozen=True)
+class PrecisionPolicyState:
+    """Snapshot of backend precision policy flags."""
+    matmul_allow_tf32: Optional[bool] = None
+    cudnn_allow_tf32: Optional[bool] = None
+    float32_matmul_precision: Optional[str] = None
+    allow_fp16_reduced_precision_reduction: Optional[bool] = None
+    allow_bf16_reduced_precision_reduction: Optional[bool] = None
+    cudnn_benchmark: Optional[bool] = None
+    cudnn_deterministic: Optional[bool] = None
+    deterministic_algorithms: Optional[bool] = None
+
+
+def capture_precision_policy_state() -> PrecisionPolicyState:
+    """Capture backend precision policy settings for consistency checks."""
+    if torch is None:
+        return PrecisionPolicyState()
+
+    matmul_allow_tf32 = None
+    allow_fp16_reduced_precision_reduction = None
+    allow_bf16_reduced_precision_reduction = None
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        matmul = torch.backends.cuda.matmul
+        if hasattr(matmul, "allow_tf32"):
+            matmul_allow_tf32 = bool(matmul.allow_tf32)
+        if hasattr(matmul, "allow_fp16_reduced_precision_reduction"):
+            allow_fp16_reduced_precision_reduction = bool(matmul.allow_fp16_reduced_precision_reduction)
+        if hasattr(matmul, "allow_bf16_reduced_precision_reduction"):
+            allow_bf16_reduced_precision_reduction = bool(matmul.allow_bf16_reduced_precision_reduction)
+
+    cudnn_allow_tf32 = None
+    cudnn_benchmark = None
+    cudnn_deterministic = None
+    if hasattr(torch.backends, "cudnn"):
+        cudnn = torch.backends.cudnn
+        if hasattr(cudnn, "allow_tf32"):
+            cudnn_allow_tf32 = bool(cudnn.allow_tf32)
+        cudnn_benchmark = bool(cudnn.benchmark)
+        cudnn_deterministic = bool(cudnn.deterministic)
+
+    float32_matmul_precision = None
+    if hasattr(torch, "get_float32_matmul_precision"):
+        float32_matmul_precision = torch.get_float32_matmul_precision()
+
+    deterministic_algorithms = None
+    if hasattr(torch, "are_deterministic_algorithms_enabled"):
+        deterministic_algorithms = bool(torch.are_deterministic_algorithms_enabled())
+
+    return PrecisionPolicyState(
+        matmul_allow_tf32=matmul_allow_tf32,
+        cudnn_allow_tf32=cudnn_allow_tf32,
+        float32_matmul_precision=float32_matmul_precision,
+        allow_fp16_reduced_precision_reduction=allow_fp16_reduced_precision_reduction,
+        allow_bf16_reduced_precision_reduction=allow_bf16_reduced_precision_reduction,
+        cudnn_benchmark=cudnn_benchmark,
+        cudnn_deterministic=cudnn_deterministic,
+        deterministic_algorithms=deterministic_algorithms,
+    )
+
+
+def check_precision_policy_consistency(
+    before: PrecisionPolicyState,
+    after: PrecisionPolicyState,
+) -> Tuple[bool, List[str]]:
+    """Detect changes in backend precision policy settings."""
+    warnings_list: List[str] = []
+    for entry in fields(PrecisionPolicyState):
+        name = entry.name
+        before_val = getattr(before, name)
+        after_val = getattr(after, name)
+        if before_val is None or after_val is None:
+            continue
+        if before_val != after_val:
+            warnings_list.append(f"{name} changed from {before_val} to {after_val}")
+    return len(warnings_list) == 0, warnings_list
+
+
+# =============================================================================
+# Memory Validity Checks
+# =============================================================================
+
+def get_tensor_addresses(tensors: Dict[str, Any]) -> Dict[str, int]:
+    """Get memory addresses of tensors for aliasing detection.
+    
+    Args:
+        tensors: Dict of tensor name -> tensor
+        
+    Returns:
+        Dict of tensor name -> data_ptr address
+    """
+    addresses = {}
+    for name, tensor in tensors.items():
+        if torch is not None and isinstance(tensor, torch.Tensor):
+            addresses[name] = tensor.data_ptr()
+    return addresses
+
+
+def check_input_output_aliasing(input_tensors: Dict[str, Any],
+                                  output_tensors: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """Check if any output tensor aliases an input tensor.
+    
+    This detects the "pre-filled output" cheat where the output buffer
+    already contains the result before benchmark_fn() runs.
+    
+    Returns:
+        Tuple of (no_aliasing, error_message_if_aliasing)
+    """
+    input_addrs = get_tensor_addresses(input_tensors)
+    output_addrs = get_tensor_addresses(output_tensors)
+    
+    for out_name, out_addr in output_addrs.items():
+        for in_name, in_addr in input_addrs.items():
+            if out_addr == in_addr:
+                return False, (
+                    f"OUTPUT ALIASING DETECTED: Output '{out_name}' has same memory address "
+                    f"as input '{in_name}' (0x{out_addr:x}). This may indicate pre-filled results."
+                )
+    
+    return True, None
+
+
+def reset_cuda_memory_pool(device: Optional[Any] = None) -> None:
+    """Reset CUDA memory pool to prevent memory reuse gaming.
+    
+    This ensures each benchmark run starts with a clean memory state,
+    preventing cached allocations from skewing timing.
+    """
+    if torch is None or not torch.cuda.is_available():
+        return
+    
+    # Full reset: sync, drop Python refs, flush allocator caches/stats
+    torch.cuda.synchronize(device)
+    gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    
+    # Best-effort allocator cache reset across PyTorch APIs
+    try:
+        if hasattr(torch, "_C") and hasattr(torch._C, "_cuda_releasePool"):
+            torch._C._cuda_releasePool()
+    except Exception:
+        pass
+    try:
+        if hasattr(torch, "_C") and hasattr(torch._C, "_cuda_cudaCachingAllocator_set_allocator_settings"):
+            torch._C._cuda_cudaCachingAllocator_set_allocator_settings("reset_allocator:True")
+        elif hasattr(torch.cuda, "memory") and hasattr(torch.cuda.memory, "_set_allocator_settings"):
+            torch.cuda.memory._set_allocator_settings("reset_allocator:True")
+    except Exception:
+        pass
+    
+    # Reset allocator statistics
+    if hasattr(torch.cuda, 'reset_peak_memory_stats'):
+        torch.cuda.reset_peak_memory_stats(device)
+    if hasattr(torch.cuda, 'reset_accumulated_memory_stats'):
+        torch.cuda.reset_accumulated_memory_stats(device)
+    try:
+        if hasattr(torch, "_C") and hasattr(torch._C, "_cuda_resetPeakHostMemoryStats"):
+            torch._C._cuda_resetPeakHostMemoryStats()
+    except Exception:
+        pass
+    torch.cuda.synchronize(device)
+    if hasattr(torch.cuda, 'reset_accumulated_memory_stats'):
+        torch.cuda.reset_accumulated_memory_stats(device)
+    gc.collect()
+    torch.cuda.synchronize(device)
+
+
+# =============================================================================
+# Setup Pre-computation Detection
+# =============================================================================
+
+def hash_tensors(tensors: Dict[str, Any]) -> str:
+    """Compute a hash of tensor contents for change detection.
+    
+    Used to detect if setup() pre-computes results by modifying tensors.
+    """
+    if torch is None:
+        return "no_torch"
+    
+    hasher = hashlib.sha256()
+    for name in sorted(tensors.keys()):
+        tensor = tensors[name]
+        if isinstance(tensor, torch.Tensor):
+            # Hash tensor metadata and content
+            hasher.update(name.encode())
+            hasher.update(str(tensor.shape).encode())
+            hasher.update(str(tensor.dtype).encode())
+            hasher.update(str(tensor.device).encode())
+            # Sample content (full hash would be too slow)
+            if tensor.numel() > 0:
+                flat = tensor.flatten()
+                # Hash first, last, and middle elements
+                samples = [flat[0].item(), flat[-1].item()]
+                if tensor.numel() > 2:
+                    samples.append(flat[tensor.numel() // 2].item())
+                hasher.update(str(samples).encode())
+    
+    return hasher.hexdigest()[:16]
+
+
+def check_setup_precomputation(get_outputs_fn, setup_fn) -> Tuple[bool, Optional[str]]:
+    """Check if setup() pre-computes results.
+    
+    Args:
+        get_outputs_fn: Function that returns dict of output tensors
+        setup_fn: The benchmark's setup() function
+        
+    Returns:
+        Tuple of (no_precomputation, error_message_if_detected)
+    """
+    # Get outputs before setup
+    try:
+        outputs_before = get_outputs_fn()
+        hash_before = hash_tensors(outputs_before)
+    except Exception:
+        # Can't check if outputs not available
+        return True, None
+    
+    # Run setup
+    setup_fn()
+    
+    # Get outputs after setup
+    try:
+        outputs_after = get_outputs_fn()
+        hash_after = hash_tensors(outputs_after)
+    except Exception:
+        return True, None
+    
+    if hash_before != hash_after:
+        return False, (
+            "SETUP PRE-COMPUTATION DETECTED: Output tensors changed during setup(). "
+            f"Hash before: {hash_before}, after: {hash_after}. "
+            "setup() should only initialize inputs (and may prepare steady-state state like CUDA graph capture), "
+            "but must not compute and stash the final outputs used for timing/verification."
+        )
+    
+    return True, None
+
+
+# =============================================================================
+# Garbage Collection Control
+# =============================================================================
+
+@contextmanager
+def gc_disabled():
+    """Context manager to disable garbage collection during timing.
+    
+    Prevents GC from interfering with timing measurements.
+    
+    Example:
+        with gc_disabled():
+            # GC won't run during this block
+            results = benchmark_fn()
+    """
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+# =============================================================================
+# torch.compile Cache Management
+# =============================================================================
+
+def clear_compile_cache() -> bool:
+    """Clear torch.compile/dynamo cache for consistent compilation.
+    
+    Returns:
+        True if cache was cleared, False if not available
+    """
+    if torch is None:
+        return False
+    
+    try:
+        # Reset dynamo
+        if hasattr(torch, '_dynamo'):
+            torch._dynamo.reset()
+        
+        # Reset inductor cache if available
+        if hasattr(torch, '_inductor') and hasattr(torch._inductor, 'codecache'):
+            if hasattr(torch._inductor.codecache, 'clear'):
+                torch._inductor.codecache.clear()
+        
+        return True
+    except Exception:
+        return False
+
+
+def get_compile_state() -> Dict[str, Any]:
+    """Get current torch.compile state for consistency checking."""
+    state = {
+        "dynamo_available": False,
+        "compile_count": 0,
+        "cache_entries": 0,
+    }
+    
+    if torch is None:
+        return state
+    
+    try:
+        if hasattr(torch, '_dynamo'):
+            state["dynamo_available"] = True
+            if hasattr(torch._dynamo, 'utils') and hasattr(torch._dynamo.utils, 'counters'):
+                counters = torch._dynamo.utils.counters
+                state["compile_count"] = counters.get("compile", {}).get("calls", 0)
+    except Exception:
+        pass
+    
+    return state
+
+
+# =============================================================================
+# Lazy Evaluation Detection
+# =============================================================================
+
+def force_tensor_evaluation(tensors: Dict[str, Any]) -> None:
+    """Force evaluation of potentially lazy tensors.
+    
+    This prevents the "lazy evaluation skip" cheat where unevaluated
+    tensors are returned without doing actual computation.
+    """
+    if torch is None:
+        return
+    
+    for name, tensor in tensors.items():
+        if isinstance(tensor, torch.Tensor):
+            # Sync ensures any pending operations complete
+            if tensor.is_cuda:
+                torch.cuda.synchronize(tensor.device)
+            # .item() on a small tensor forces full evaluation
+            # (we use a single element to minimize overhead)
+            if tensor.numel() > 0:
+                try:
+                    _ = tensor.flatten()[0].item()
+                except Exception:
+                    pass  # Some tensors may not support .item()
+
+
+# =============================================================================
+# Environment Validation
+# =============================================================================
+
+@dataclass(frozen=True)
+class EnvironmentValidationResult:
+    """Structured result for environment validation."""
+
+    is_valid: bool
+    errors: List[str]
+    warnings: List[str]
+    details: Dict[str, Any]
+
+
+@dataclass
+class EnvironmentProbe:
+    """Probe host environment via a filesystem root.
+
+    Tests can provide a synthetic root containing /proc and /sys snapshots.
+    """
+
+    root: Path = Path("/")
+    env: Dict[str, str] = field(default_factory=lambda: dict(os.environ))
+    cpu_affinity: Optional[Set[int]] = None
+
+    def resolve(self, path: str | Path) -> Path:
+        rel = str(path)
+        rel = rel.lstrip("/")
+        return self.root / rel
+
+    def exists(self, path: str | Path) -> bool:
+        return self.resolve(path).exists()
+
+    def read_text(self, path: str | Path) -> str:
+        return self.resolve(path).read_text(encoding="utf-8").strip()
+
+    def get_cpu_affinity(self) -> Optional[Set[int]]:
+        if self.cpu_affinity is not None:
+            return set(self.cpu_affinity)
+        try:
+            return set(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+        except Exception:
+            return None
+
+
+def _parse_int_set(spec: str) -> Set[int]:
+    """Parse Linux list formats like '0-3,8,10-12' into a set of ints."""
+    spec = spec.strip()
+    if not spec:
+        return set()
+    result: Set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, end_s = part.split("-", 1)
+            start = int(start_s)
+            end = int(end_s)
+            if end < start:
+                raise ValueError(f"Invalid range '{part}'")
+            result.update(range(start, end + 1))
+        else:
+            result.add(int(part))
+    return result
+
+
+def _read_optional(probe: EnvironmentProbe, path: str | Path) -> Optional[str]:
+    resolved = probe.resolve(path)
+    if not resolved.exists():
+        return None
+    try:
+        return resolved.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+
+
+def _parse_cgroup_v2_path(cgroup_text: str) -> Optional[str]:
+    for line in cgroup_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # v2 unified format: "0::/some/path"
+        if line.startswith("0::"):
+            parts = line.split(":", 2)
+            if len(parts) == 3:
+                return parts[2] or "/"
+    return None
+
+
+def validate_environment(
+    *,
+    device: Optional["torch.device"] = None,
+    probe: Optional[EnvironmentProbe] = None,
+    allow_virtualization: bool = True,
+) -> EnvironmentValidationResult:
+    """Validate benchmark environment is suitable (fail-fast on known invalid states)."""
+    probe = probe or EnvironmentProbe()
+    errors: List[str] = []
+    warnings_list: List[str] = []
+    details: Dict[str, Any] = {
+        "platform": sys.platform,
+    }
+
+    if not sys.platform.startswith("linux"):
+        errors.append(f"Non-Linux platform '{sys.platform}' is not supported for benchmark validity checks.")
+        return EnvironmentValidationResult(False, errors, warnings_list, details)
+
+    # Resolve device expectation
+    if device is None:
+        if torch is None:
+            errors.append("PyTorch is not available; cannot validate benchmark environment.")
+            return EnvironmentValidationResult(False, errors, warnings_list, details)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    details["device_type"] = device.type
+
+    # CUDA availability (required if running on CUDA device)
+    if device.type == "cuda":
+        if torch is None or not torch.cuda.is_available():
+            errors.append("CUDA device requested but CUDA is not available (missing /dev/nvidia* or driver issue).")
+        else:
+            gpu_count = torch.cuda.device_count()
+            details["gpu_count"] = gpu_count
+            if gpu_count > 1:
+                warnings_list.append(
+                    f"Multiple GPUs detected ({gpu_count}). Ensure benchmarks use consistent device placement."
+                )
+
+    # Swap interference (Memory category)
+    swaps = _read_optional(probe, "/proc/swaps")
+    if swaps is None:
+        warnings_list.append("Cannot read /proc/swaps; swap state cannot be validated.")
+    else:
+        swap_lines = [ln for ln in swaps.splitlines() if ln.strip()]
+        if len(swap_lines) > 1:
+            errors.append(f"Swap is enabled ({len(swap_lines) - 1} swap device(s) active). Disable swap for benchmarking.")
+    swappiness = _read_optional(probe, "/proc/sys/vm/swappiness")
+    if swappiness is not None:
+        try:
+            details["vm_swappiness"] = int(swappiness.strip())
+        except ValueError:
+            warnings_list.append(f"Could not parse /proc/sys/vm/swappiness value: '{swappiness}'.")
+
+    # CPU governor (Environment category)
+    governors: Dict[str, str] = {}
+    cpufreq_root = probe.resolve("/sys/devices/system/cpu/cpufreq")
+    if cpufreq_root.exists():
+        for policy_dir in sorted(cpufreq_root.glob("policy*")):
+            gov_path = policy_dir / "scaling_governor"
+            if gov_path.exists():
+                try:
+                    governors[policy_dir.name] = gov_path.read_text(encoding="utf-8").strip()
+                except Exception:
+                    warnings_list.append(f"Failed to read CPU governor at {gov_path}.")
+    if not governors:
+        warnings_list.append("CPU governor not exposed via cpufreq sysfs; cannot validate governor lock.")
+    else:
+        details["cpu_governors"] = dict(governors)
+        non_perf = {k: v for k, v in governors.items() if v != "performance"}
+        if non_perf:
+            errors.append(f"CPU governor mismatch: expected 'performance', got {non_perf}.")
+
+    # Cgroup resource limits (Container Resource Limits)
+    cgroup_mount = probe.resolve("/sys/fs/cgroup")
+    if not cgroup_mount.exists():
+        warnings_list.append("Cgroup mount (/sys/fs/cgroup) not found; cannot validate cgroup resource limits.")
+    else:
+        cgroup_text = _read_optional(probe, "/proc/self/cgroup")
+        cgroup_path = _parse_cgroup_v2_path(cgroup_text or "")
+        if cgroup_path is None:
+            warnings_list.append("Could not parse cgroup v2 path from /proc/self/cgroup; cgroup limits not validated.")
+        else:
+            details["cgroup_path"] = cgroup_path
+            # cpu.max (quota/period)
+            cpu_max = _read_optional(probe, str(Path("/sys/fs/cgroup") / cgroup_path.lstrip("/") / "cpu.max"))
+            if cpu_max is not None:
+                parts = cpu_max.split()
+                if parts:
+                    details["cgroup_cpu_max"] = cpu_max
+                    if parts[0] != "max":
+                        errors.append(f"CPU quota is set via cgroup cpu.max='{cpu_max}'. Remove CPU quotas for benchmarking.")
+            else:
+                warnings_list.append("Could not read cgroup cpu.max; CPU quota limits not validated.")
+
+            mem_max = _read_optional(probe, str(Path("/sys/fs/cgroup") / cgroup_path.lstrip("/") / "memory.max"))
+            if mem_max is not None:
+                details["cgroup_memory_max"] = mem_max
+                if mem_max != "max":
+                    errors.append(
+                        f"Memory limit is set via cgroup memory.max='{mem_max}'. Remove memory limits for benchmarking."
+                    )
+            else:
+                warnings_list.append("Could not read cgroup memory.max; memory limits not validated.")
+
+            # cpuset effective files may not be present in delegated cgroups; fall back to root for visibility.
+            cpuset_cpu = _read_optional(probe, str(Path("/sys/fs/cgroup") / cgroup_path.lstrip("/") / "cpuset.cpus.effective"))
+            if cpuset_cpu is None:
+                cpuset_cpu = _read_optional(probe, "/sys/fs/cgroup/cpuset.cpus.effective")
+            if cpuset_cpu is not None:
+                details["cpuset_cpus_effective"] = cpuset_cpu
+            else:
+                warnings_list.append("Could not read cpuset.cpus.effective; CPU pinning not validated.")
+
+            cpuset_mems = _read_optional(probe, str(Path("/sys/fs/cgroup") / cgroup_path.lstrip("/") / "cpuset.mems.effective"))
+            if cpuset_mems is None:
+                cpuset_mems = _read_optional(probe, "/sys/fs/cgroup/cpuset.mems.effective")
+            if cpuset_mems is not None:
+                details["cpuset_mems_effective"] = cpuset_mems
+            else:
+                warnings_list.append("Could not read cpuset.mems.effective; NUMA pinning not validated.")
+
+    # NUMA checks (NUMA Inconsistency)
+    node_root = probe.resolve("/sys/devices/system/node")
+    numa_nodes: List[int] = []
+    if node_root.exists():
+        for entry in sorted(node_root.glob("node*")):
+            match = re.match(r"node(\d+)$", entry.name)
+            if match:
+                numa_nodes.append(int(match.group(1)))
+    details["numa_nodes"] = list(numa_nodes)
+    if len(numa_nodes) > 1:
+        affinity = probe.get_cpu_affinity()
+        if affinity is None:
+            warnings_list.append("CPU affinity unavailable; cannot validate NUMA pinning.")
+        else:
+            # Map CPUs to nodes via node*/cpulist when present.
+            cpu_to_nodes: Dict[int, int] = {}
+            missing_cpulist = False
+            for node_id in numa_nodes:
+                cpulist_text = _read_optional(probe, f"/sys/devices/system/node/node{node_id}/cpulist")
+                if cpulist_text is None:
+                    missing_cpulist = True
+                    continue
+                try:
+                    for cpu in _parse_int_set(cpulist_text):
+                        cpu_to_nodes[cpu] = node_id
+                except Exception:
+                    missing_cpulist = True
+            if missing_cpulist or not cpu_to_nodes:
+                warnings_list.append("NUMA cpulist unavailable; cannot validate NUMA pinning.")
+            else:
+                nodes_used = {cpu_to_nodes[cpu] for cpu in affinity if cpu in cpu_to_nodes}
+                details["numa_nodes_in_affinity"] = sorted(nodes_used)
+                if len(nodes_used) > 1:
+                    errors.append(
+                        f"CPU affinity spans multiple NUMA nodes ({sorted(nodes_used)}). Pin to a single NUMA node for benchmarking."
+                    )
+
+    # Virtualization detection (Virtualization Overhead)
+    cpuinfo = _read_optional(probe, "/proc/cpuinfo")
+    product_name = _read_optional(probe, "/sys/devices/virtual/dmi/id/product_name")
+    details["dmi_product_name"] = product_name
+    is_virtualized = False
+    if cpuinfo is not None and "hypervisor" in cpuinfo.lower():
+        is_virtualized = True
+    if product_name is not None and any(tag in product_name.lower() for tag in ("qemu", "kvm", "vmware", "virtualbox", "hyper-v")):
+        is_virtualized = True
+    details["virtualized"] = is_virtualized
+    if is_virtualized:
+        product_hint = f" (dmi_product_name={product_name!r})" if product_name else ""
+        message = (
+            "Virtualization detected (hypervisor present). "
+            "Bare metal is recommended for final benchmark numbers "
+            "(Nsight tools like nsys/ncu may be unavailable or misleading)."
+            f"{product_hint}"
+        )
+        if allow_virtualization:
+            warnings_list.append(f"{message} Continuing because allow_virtualization=True.")
+        else:
+            errors.append(message)
+
+    # torch.compile backend sanity (Compile category)
+    try:
+        if torch is not None and hasattr(torch, "_dynamo"):
+            config = getattr(torch._dynamo, "config", None)
+            if config and hasattr(config, "suppress_errors") and config.suppress_errors:
+                warnings_list.append("torch._dynamo.config.suppress_errors=True may hide compilation issues.")
+    except Exception:
+        warnings_list.append("Failed to inspect torch._dynamo config for suppress_errors.")
+
+    is_valid = len(errors) == 0
+    return EnvironmentValidationResult(is_valid, errors, warnings_list, details)
+
+
+# =============================================================================
+# Memory Allocation Tracking
+# =============================================================================
+
+@dataclass
+class MemoryAllocationSnapshot:
+    """Snapshot of CUDA memory allocations for tracking patterns."""
+    allocated_mb: float
+    reserved_mb: float
+    max_allocated_mb: float
+    num_allocs: int
+    num_frees: int
+    
+    @classmethod
+    def capture(cls, device: Optional[Any] = None) -> "MemoryAllocationSnapshot":
+        """Capture current memory allocation state."""
+        if torch is None or not torch.cuda.is_available():
+            return cls(0.0, 0.0, 0.0, 0, 0)
+        
+        stats = torch.cuda.memory_stats(device)
+        return cls(
+            allocated_mb=torch.cuda.memory_allocated(device) / (1024 * 1024),
+            reserved_mb=torch.cuda.memory_reserved(device) / (1024 * 1024),
+            max_allocated_mb=torch.cuda.max_memory_allocated(device) / (1024 * 1024),
+            num_allocs=stats.get("num_alloc_retries", 0) + stats.get("allocation.all.current", 0),
+            num_frees=stats.get("num_ooms", 0),
+        )
+
+
+class MemoryAllocationTracker:
+    """Track memory allocations during benchmark execution.
+    
+    Uses PyTorch's memory hooks to track allocations and detect
+    suspicious patterns like pre-allocated outputs or memory leaks.
+    
+    Usage:
+        tracker = MemoryAllocationTracker(device)
+        tracker.start()
+        # ... run benchmark ...
+        tracker.stop()
+        issues = tracker.check_patterns()
+    """
+    
+    def __init__(self, device: Optional[Any] = None):
+        self.device = device
+        self.allocations: List[Dict[str, Any]] = []
+        self.frees: List[Dict[str, Any]] = []
+        self._hook_handle = None
+        self.start_snapshot: Optional[MemoryAllocationSnapshot] = None
+        self.end_snapshot: Optional[MemoryAllocationSnapshot] = None
+    
+    def start(self) -> None:
+        """Start tracking memory allocations."""
+        if torch is None or not torch.cuda.is_available():
+            return
+        
+        self.allocations = []
+        self.frees = []
+        self.start_snapshot = MemoryAllocationSnapshot.capture(self.device)
+        
+        # Use memory snapshot for tracking (simpler than hooks)
+        torch.cuda.reset_peak_memory_stats(self.device)
+    
+    def stop(self) -> None:
+        """Stop tracking and capture final state."""
+        if torch is None or not torch.cuda.is_available():
+            return
+        
+        self.end_snapshot = MemoryAllocationSnapshot.capture(self.device)
+    
+    def check_patterns(
+        self,
+        max_memory_increase_mb: float = 100.0,
+        max_peak_vs_end_ratio: float = 2.0,
+    ) -> Tuple[bool, List[str]]:
+        """Check for suspicious memory allocation patterns.
+        
+        Args:
+            max_memory_increase_mb: Maximum allowed memory increase during benchmark
+            max_peak_vs_end_ratio: Maximum allowed ratio of peak to final memory
+            
+        Returns:
+            Tuple of (no_issues, list_of_warnings)
+        """
+        warnings_list: List[str] = []
+        
+        if self.start_snapshot is None or self.end_snapshot is None:
+            return True, warnings_list
+        
+        # Check for memory increase (potential leak)
+        memory_increase = self.end_snapshot.allocated_mb - self.start_snapshot.allocated_mb
+        if memory_increase > max_memory_increase_mb:
+            warnings_list.append(
+                f"MEMORY INCREASE: Allocated memory increased by {memory_increase:.1f}MB "
+                f"during benchmark (threshold: {max_memory_increase_mb}MB). "
+                "This may indicate a memory leak or pre-allocated outputs."
+            )
+        
+        # Check peak vs end ratio (could indicate temporary large allocations)
+        if self.end_snapshot.allocated_mb > 0:
+            peak_ratio = self.end_snapshot.max_allocated_mb / self.end_snapshot.allocated_mb
+            if peak_ratio > max_peak_vs_end_ratio:
+                warnings_list.append(
+                    f"MEMORY PEAK SPIKE: Peak memory ({self.end_snapshot.max_allocated_mb:.1f}MB) "
+                    f"was {peak_ratio:.1f}x final memory ({self.end_snapshot.allocated_mb:.1f}MB). "
+                    "This may indicate inefficient memory usage."
+                )
+        
+        # Check for potential pre-allocation (high starting memory that doesn't grow)
+        if self.start_snapshot.allocated_mb > 100 and memory_increase < 10:
+            warnings_list.append(
+                f"POTENTIAL PRE-ALLOCATION: High initial memory ({self.start_snapshot.allocated_mb:.1f}MB) "
+                f"with minimal growth ({memory_increase:.1f}MB). "
+                "Verify outputs aren't pre-computed in setup()."
+            )
+        
+        return len(warnings_list) == 0, warnings_list
+    
+    def get_stats(self) -> Dict[str, float]:
+        """Get memory statistics summary."""
+        if self.start_snapshot is None or self.end_snapshot is None:
+            return {}
+        
+        return {
+            "start_allocated_mb": self.start_snapshot.allocated_mb,
+            "end_allocated_mb": self.end_snapshot.allocated_mb,
+            "peak_allocated_mb": self.end_snapshot.max_allocated_mb,
+            "memory_increase_mb": self.end_snapshot.allocated_mb - self.start_snapshot.allocated_mb,
+        }
+
+
+@contextmanager
+def track_memory_allocations(device: Optional[Any] = None):
+    """Context manager for memory allocation tracking.
+    
+    Example:
+        with track_memory_allocations() as tracker:
+            # ... run benchmark ...
+        no_issues, warnings = tracker.check_patterns()
+    """
+    tracker = MemoryAllocationTracker(device)
+    tracker.start()
+    try:
+        yield tracker
+    finally:
+        tracker.stop()
+
+
+# =============================================================================
+# CUDA Stream Auditing
+# =============================================================================
+
+
+def _resolve_stream_id(stream: Any) -> Optional[int]:
+    """Return a stable identifier for a CUDA stream."""
+    if stream is None:
+        return None
+    try:
+        if hasattr(stream, "cuda_stream"):
+            return int(stream.cuda_stream)
+    except Exception:
+        return None
+    try:
+        return int(id(stream))
+    except Exception:
+        return None
+
+@dataclass
+class StreamUsageInfo:
+    """Information about CUDA stream usage during benchmark."""
+    default_stream_ops: int = 0
+    custom_streams_detected: int = 0
+    default_stream_id: Optional[int] = None
+    stream_ids: Set[int] = None
+    sync_operations: int = 0
+    unsync_warning: bool = False
+    
+    def __post_init__(self):
+        if self.stream_ids is None:
+            self.stream_ids = set()
+
+
+class StreamAuditor:
+    """Audits CUDA stream usage during benchmark execution.
+    
+    This helps detect multi-stream timing exploits (Locus/KernelBench 2025)
+    where work is launched on non-default streams while the timer only
+    measures the default stream.
+    
+    Usage:
+        auditor = StreamAuditor()
+        auditor.start()
+        # ... run benchmark ...
+        auditor.stop()
+        info = auditor.get_info()
+        warnings = auditor.check_issues()
+    """
+    
+    def __init__(self, device: Optional[Any] = None):
+        self.device = device
+        self._start_time: Optional[float] = None
+        self._stream_events: List[Dict[str, Any]] = []
+        self._default_stream_id: Optional[int] = None
+        self._observed_streams: Set[int] = set()
+        self._sync_count: int = 0
+        self._orig_stream_cls = None
+        self._orig_stream_synchronize = None
+        self._orig_stream_wait_stream = None
+        self._orig_synchronize = None
+        self._orig_stream_fn = None
+        self._orig_set_stream_fn = None
+    
+    def start(self) -> None:
+        """Start stream auditing."""
+        if torch is None or not torch.cuda.is_available():
+            return
+        
+        import time
+        self._start_time = time.perf_counter()
+        self._stream_events = []
+        self._observed_streams = set()
+        self._sync_count = 0
+        
+        # Record default stream ID
+        default_stream = torch.cuda.current_stream(self.device)
+        self._default_stream_id = default_stream.cuda_stream
+        self._observed_streams.add(self._default_stream_id)
+        
+        # Monkeypatch torch.cuda.Stream to record new stream creation
+        try:
+            self._orig_stream_cls = torch.cuda.Stream
+            auditor = self
+            orig_stream_cls = self._orig_stream_cls
+            
+            def _audited_stream(*args, **kwargs):  # type: ignore[override]
+                stream = orig_stream_cls(*args, **kwargs)
+                auditor.record_stream_event(stream, operation="stream_create")
+                return stream
+            
+            torch.cuda.Stream = _audited_stream  # type: ignore[assignment]
+        except Exception:
+            self._orig_stream_cls = None
+
+        # Monkeypatch Stream methods to capture stream sync / dependencies
+        if self._orig_stream_cls is not None:
+            try:
+                self._orig_stream_synchronize = self._orig_stream_cls.synchronize
+                auditor = self
+
+                def _audited_stream_synchronize(stream_self, *args, **kwargs):
+                    auditor.record_sync("stream")
+                    return auditor._orig_stream_synchronize(stream_self, *args, **kwargs)
+
+                self._orig_stream_cls.synchronize = _audited_stream_synchronize  # type: ignore[assignment]
+            except Exception:
+                self._orig_stream_synchronize = None
+
+            try:
+                self._orig_stream_wait_stream = self._orig_stream_cls.wait_stream
+                auditor = self
+
+                def _audited_stream_wait_stream(stream_self, stream, *args, **kwargs):
+                    auditor.record_sync("wait_stream")
+                    auditor.record_stream_event(stream, operation="wait_stream")
+                    return auditor._orig_stream_wait_stream(stream_self, stream, *args, **kwargs)
+
+                self._orig_stream_cls.wait_stream = _audited_stream_wait_stream  # type: ignore[assignment]
+            except Exception:
+                self._orig_stream_wait_stream = None
+        
+        # Monkeypatch synchronize to capture syncs
+        try:
+            self._orig_synchronize = torch.cuda.synchronize
+            auditor = self
+            
+            def _audited_synchronize(*args, **kwargs):
+                auditor.record_sync("device")
+                return auditor._orig_synchronize(*args, **kwargs)
+            
+            torch.cuda.synchronize = _audited_synchronize  # type: ignore[assignment]
+        except Exception:
+            self._orig_synchronize = None
+
+        # Monkeypatch torch.cuda.stream to record usage of existing streams
+        try:
+            self._orig_stream_fn = torch.cuda.stream
+            auditor = self
+
+            def _audited_stream_fn(stream, *args, **kwargs):
+                auditor.record_stream_event(stream, operation="stream_ctx")
+                return auditor._orig_stream_fn(stream, *args, **kwargs)
+
+            torch.cuda.stream = _audited_stream_fn  # type: ignore[assignment]
+        except Exception:
+            self._orig_stream_fn = None
+
+        # Monkeypatch torch.cuda.set_stream to capture explicit stream switches
+        try:
+            self._orig_set_stream_fn = torch.cuda.set_stream
+            auditor = self
+
+            def _audited_set_stream(stream, *args, **kwargs):
+                auditor.record_stream_event(stream, operation="set_stream")
+                return auditor._orig_set_stream_fn(stream, *args, **kwargs)
+
+            torch.cuda.set_stream = _audited_set_stream  # type: ignore[assignment]
+        except Exception:
+            self._orig_set_stream_fn = None
+    
+    def record_stream_event(self, stream: Any, operation: str = "kernel") -> None:
+        """Record a stream event for auditing.
+        
+        Call this manually when a custom stream is used, or use hooks.
+        """
+        if torch is None or not torch.cuda.is_available():
+            return
+        
+        import time
+        stream_id = _resolve_stream_id(stream)
+        if stream_id is None:
+            return
+        self._observed_streams.add(stream_id)
+        
+        self._stream_events.append({
+            "time": time.perf_counter() - (self._start_time or 0),
+            "stream_id": stream_id,
+            "operation": operation,
+            "is_default": stream_id == self._default_stream_id,
+        })
+    
+    def record_sync(self, sync_type: str = "device") -> None:
+        """Record a synchronization event."""
+        self._sync_count += 1
+        
+        import time
+        self._stream_events.append({
+            "time": time.perf_counter() - (self._start_time or 0),
+            "stream_id": None,
+            "operation": f"sync_{sync_type}",
+            "is_default": None,
+        })
+    
+    def stop(self) -> None:
+        """Stop stream auditing."""
+        if torch is None or not torch.cuda.is_available():
+            return
+        if self._orig_stream_cls is not None:
+            try:
+                torch.cuda.Stream = self._orig_stream_cls  # type: ignore[assignment]
+            except Exception:
+                pass
+            if self._orig_stream_synchronize is not None:
+                try:
+                    self._orig_stream_cls.synchronize = self._orig_stream_synchronize  # type: ignore[assignment]
+                except Exception:
+                    pass
+            if self._orig_stream_wait_stream is not None:
+                try:
+                    self._orig_stream_cls.wait_stream = self._orig_stream_wait_stream  # type: ignore[assignment]
+                except Exception:
+                    pass
+        if self._orig_synchronize is not None:
+            try:
+                torch.cuda.synchronize = self._orig_synchronize  # type: ignore[assignment]
+            except Exception:
+                pass
+        if self._orig_stream_fn is not None:
+            try:
+                torch.cuda.stream = self._orig_stream_fn  # type: ignore[assignment]
+            except Exception:
+                pass
+        if self._orig_set_stream_fn is not None:
+            try:
+                torch.cuda.set_stream = self._orig_set_stream_fn  # type: ignore[assignment]
+            except Exception:
+                pass
+    
+    def get_info(self) -> StreamUsageInfo:
+        """Get stream usage information."""
+        info = StreamUsageInfo()
+        
+        if self._default_stream_id is not None:
+            info.default_stream_id = self._default_stream_id
+            info.default_stream_ops = sum(
+                1 for e in self._stream_events 
+                if e["is_default"] is True and e["operation"] != "sync_device"
+            )
+            
+        info.custom_streams_detected = len(self._observed_streams) - 1  # Exclude default
+        info.stream_ids = self._observed_streams.copy()
+        info.sync_operations = self._sync_count
+        
+        # Check if custom streams were used without sync
+        if info.custom_streams_detected > 0 and self._sync_count == 0:
+            info.unsync_warning = True
+        
+        return info
+    
+    def check_issues(self) -> Tuple[bool, List[str]]:
+        """Check for stream usage issues.
+        
+        Returns:
+            Tuple of (no_issues, list_of_warnings)
+        """
+        warnings_list: List[str] = []
+        info = self.get_info()
+        
+        # Warning: custom streams without synchronization
+        if info.unsync_warning:
+            warnings_list.append(
+                f"STREAM SYNC WARNING: {info.custom_streams_detected} custom stream(s) "
+                "detected but no synchronization was recorded. "
+                "This could allow work to escape timing measurement. "
+                "Use torch.cuda.synchronize(), stream.synchronize(), or current_stream.wait_stream(...) "
+                "for accurate multi-stream timing."
+            )
+        
+        # Warning: many custom streams (unusual for benchmarks)
+        if info.custom_streams_detected > 2:
+            warnings_list.append(
+                f"MULTI-STREAM WARNING: {info.custom_streams_detected} custom streams detected. "
+                "Unusual for standard benchmarks - verify all streams are properly synchronized."
+            )
+        
+        return len(warnings_list) == 0, warnings_list
+
+
+@contextmanager
+def audit_streams(device: Optional[Any] = None):
+    """Context manager for CUDA stream auditing.
+    
+    Example:
+        with audit_streams() as auditor:
+            # ... run benchmark ...
+        no_issues, warnings = auditor.check_issues()
+    """
+    auditor = StreamAuditor(device)
+    auditor.start()
+    try:
+        yield auditor
+    finally:
+        auditor.stop()
+
+
+def get_active_streams(device: Optional[Any] = None, declared_streams: Optional[List[Any]] = None) -> List[int]:
+    """Get list of active CUDA streams on a device.
+    
+    Note: This uses internal PyTorch APIs and may not be comprehensive.
+    """
+    if torch is None or not torch.cuda.is_available():
+        return []
+    
+    streams: Set[int] = set()
+    
+    # Get default stream
+    default_stream = torch.cuda.current_stream(device)
+    streams.add(int(default_stream.cuda_stream))
+    
+    if declared_streams:
+        for stream in declared_streams:
+            stream_id = _resolve_stream_id(stream)
+            if stream_id is not None:
+                streams.add(stream_id)
+    
+    return list(streams)
+
+
+def check_stream_sync_completeness(
+    pre_streams: List[int],
+    post_streams: List[int],
+) -> Tuple[bool, Optional[str]]:
+    """Check if stream synchronization was complete.
+    
+    Compares streams before and after an operation to detect
+    potential timing issues.
+    
+    Args:
+        pre_streams: Stream IDs before operation
+        post_streams: Stream IDs after operation
+        
+    Returns:
+        Tuple of (sync_complete, warning_message)
+    """
+    if not pre_streams or not post_streams:
+        return True, None
+    
+    # If new streams appeared, that's suspicious
+    new_streams = set(post_streams) - set(pre_streams)
+    if new_streams:
+        return False, (
+            f"NEW STREAMS WARNING: {len(new_streams)} new stream(s) created during benchmark. "
+            "Verify all streams are synchronized before timing ends."
+        )
+    
+    return True, None
+
+
+# =============================================================================
+# Distributed Verification
+# =============================================================================
+
+@dataclass
+class DistributedVerifyResult:
+    """Result of distributed verification across ranks."""
+    all_ranks_executed: bool
+    outputs_consistent: bool
+    rank_outputs: Dict[int, Any]  # rank -> output hash
+    inconsistent_ranks: List[int]
+    error_message: Optional[str] = None
+
+
+def gather_rank_outputs(
+    local_output: Any,
+    world_size: int = 1,
+    rank: int = 0,
+) -> Dict[int, str]:
+    """Gather output hashes from all ranks for consistency verification.
+    
+    In distributed settings, this uses torch.distributed to gather output
+    checksums from all ranks to ensure they computed consistent results.
+    
+    Args:
+        local_output: The local rank's output tensor(s)
+        world_size: Total number of ranks
+        rank: Current rank
+        
+    Returns:
+        Dict mapping rank -> output hash (only complete on rank 0)
+    """
+    if torch is None:
+        return {0: "no_torch"}
+    
+    # Compute local hash
+    if isinstance(local_output, torch.Tensor):
+        local_hash = hashlib.sha256(local_output.cpu().numpy().tobytes()).hexdigest()[:16]
+    elif isinstance(local_output, dict):
+        hasher = hashlib.sha256()
+        for k in sorted(local_output.keys()):
+            v = local_output[k]
+            if isinstance(v, torch.Tensor):
+                hasher.update(k.encode())
+                hasher.update(v.cpu().numpy().tobytes())
+        local_hash = hasher.hexdigest()[:16]
+    else:
+        local_hash = hashlib.sha256(str(local_output).encode()).hexdigest()[:16]
+    
+    # Single-GPU case
+    if world_size == 1:
+        return {0: local_hash}
+    
+    # Multi-GPU: gather hashes from all ranks
+    try:
+        import torch.distributed as dist
+        
+        if not dist.is_initialized():
+            return {rank: local_hash}
+        
+        # Gather all hashes to rank 0
+        all_hashes: List[str] = [None] * world_size  # type: ignore
+        
+        # Use all_gather_object for string data
+        if hasattr(dist, 'all_gather_object'):
+            dist.all_gather_object(all_hashes, local_hash)
+            return {i: h for i, h in enumerate(all_hashes) if h is not None}
+        else:
+            # Fallback: just return local
+            return {rank: local_hash}
+            
+    except Exception:
+        # Distributed not available or failed
+        return {rank: local_hash}
+
+
+def verify_distributed_outputs(
+    rank_outputs: Dict[int, str],
+    expected_world_size: int,
+) -> DistributedVerifyResult:
+    """Verify that all ranks executed and produced consistent outputs.
+    
+    This detects:
+    - Rank skipping: Some ranks didn't execute work
+    - Inconsistent outputs: Ranks produced different results (when they shouldn't)
+    
+    Args:
+        rank_outputs: Dict mapping rank -> output hash
+        expected_world_size: Expected number of ranks
+        
+    Returns:
+        DistributedVerifyResult with verification outcome
+    """
+    result = DistributedVerifyResult(
+        all_ranks_executed=True,
+        outputs_consistent=True,
+        rank_outputs=rank_outputs,
+        inconsistent_ranks=[],
+    )
+    
+    # Check all ranks reported
+    if len(rank_outputs) != expected_world_size:
+        result.all_ranks_executed = False
+        missing_ranks = set(range(expected_world_size)) - set(rank_outputs.keys())
+        result.error_message = f"RANK SKIPPING: Missing outputs from ranks {sorted(missing_ranks)}"
+        return result
+    
+    # Check outputs are consistent
+    unique_hashes = set(rank_outputs.values())
+    if len(unique_hashes) > 1:
+        result.outputs_consistent = False
+        
+        # Find the majority hash (assumed correct)
+        hash_counts: Dict[str, int] = {}
+        for h in rank_outputs.values():
+            hash_counts[h] = hash_counts.get(h, 0) + 1
+        majority_hash = max(hash_counts, key=lambda x: hash_counts[x])
+        
+        # Find inconsistent ranks
+        result.inconsistent_ranks = [
+            r for r, h in rank_outputs.items() if h != majority_hash
+        ]
+        result.error_message = (
+            f"OUTPUT INCONSISTENCY: Ranks {result.inconsistent_ranks} produced different outputs. "
+            f"Majority hash: {majority_hash}, inconsistent: "
+            f"{[rank_outputs[r] for r in result.inconsistent_ranks]}"
+        )
+    
+    return result
+
+
+def check_rank_execution(
+    benchmark: Any,
+    world_size: int,
+    rank: int,
+) -> Tuple[bool, Optional[str]]:
+    """Check if a benchmark properly executed on the current rank.
+    
+    This is a lightweight check to detect rank skipping by verifying
+    that the benchmark actually performed computation on this rank.
+    
+    Args:
+        benchmark: The benchmark instance
+        world_size: Total number of ranks
+        rank: Current rank
+        
+    Returns:
+        Tuple of (executed, error_message)
+    """
+    # Check for explicit rank skip flags
+    if hasattr(benchmark, '_skip_rank') and benchmark._skip_rank:
+        return False, f"Rank {rank} has _skip_rank=True"
+    
+    marker = getattr(benchmark, "_execution_marker", None)
+    if marker is not None:
+        try:
+            if torch is not None and isinstance(marker, torch.Tensor):
+                if marker.numel() == 0 or not bool(marker.detach().cpu().sum().item()):
+                    return False, f"Rank {rank} execution marker empty"
+                return True, None
+            return False, f"Rank {rank} execution marker invalid type ({type(marker)})"
+        except Exception as exc:
+            return False, f"Rank {rank} execution marker check failed: {exc}"
+    
+    # Check if benchmark has output (indicates execution)
+    if hasattr(benchmark, 'get_verify_output'):
+        try:
+            output = benchmark.get_verify_output()
+            if output is None:
+                return False, f"Rank {rank} produced no output"
+            return True, None
+        except NotImplementedError:
+            # Benchmark doesn't implement output, can't verify
+            return True, None
+        except Exception as e:
+            return False, f"Rank {rank} failed to get output: {e}"
+    
+    return True, None
+
+
+# =============================================================================
+# CUDA Graph Capture Cheat Detection
+# =============================================================================
+
+@dataclass
+class GraphCaptureState:
+    """State tracking for CUDA graph capture detection."""
+    capturing: bool = False
+    capture_start_time: Optional[float] = None
+    capture_end_time: Optional[float] = None
+    kernels_during_capture: int = 0
+    memory_allocated_during_capture: float = 0.0
+    work_detected_during_capture: bool = False
+
+
+class GraphCaptureCheatDetector:
+    """Detects if work is being done during CUDA graph capture instead of replay.
+    
+    The "graph capture cheat" is when a benchmark does actual computation
+    during the graph capture phase (which happens once) rather than during
+    graph replay (which is what's being timed). This makes the benchmark
+    appear faster than it actually is.
+    
+    Detection Strategy:
+    1. Track memory allocations during capture vs replay
+    2. Track GPU utilization during capture
+    3. Compare capture time to replay time (capture should be similar or longer)
+    
+    Usage:
+        detector = GraphCaptureCheatDetector()
+        
+        # During capture
+        detector.start_capture()
+        with torch.cuda.graph(g):
+            benchmark_fn()  # Capture the work
+        detector.end_capture()
+        
+        # During replay (timed)
+        detector.start_replay()
+        g.replay()
+        detector.end_replay()
+        
+        # Check for cheating
+        is_cheating, reason = detector.check_for_cheat()
+    """
+    
+    def __init__(self, device: Optional[Any] = None):
+        self.device = device
+        self.capture_state: Optional[GraphCaptureState] = None
+        self.replay_times: List[float] = []
+        self._capture_start_memory: float = 0.0
+        self._replay_start_memory: float = 0.0
+    
+    def start_capture(self) -> None:
+        """Mark the start of CUDA graph capture."""
+        import time
+        
+        self.capture_state = GraphCaptureState(capturing=True)
+        self.capture_state.capture_start_time = time.perf_counter()
+        
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+            self._capture_start_memory = torch.cuda.memory_allocated(self.device) / (1024 * 1024)
+    
+    def end_capture(self) -> None:
+        """Mark the end of CUDA graph capture."""
+        import time
+        
+        if self.capture_state is None:
+            return
+        
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+        
+        self.capture_state.capture_end_time = time.perf_counter()
+        self.capture_state.capturing = False
+        
+        if torch is not None and torch.cuda.is_available():
+            capture_end_memory = torch.cuda.memory_allocated(self.device) / (1024 * 1024)
+            self.capture_state.memory_allocated_during_capture = (
+                capture_end_memory - self._capture_start_memory
+            )
+    
+    def start_replay(self) -> None:
+        """Mark the start of a CUDA graph replay iteration."""
+        if torch is not None and torch.cuda.is_available():
+            self._replay_start_memory = torch.cuda.memory_allocated(self.device) / (1024 * 1024)
+    
+    def end_replay(self, replay_time_ms: float) -> None:
+        """Record a replay iteration time.
+        
+        Args:
+            replay_time_ms: Time for this replay iteration in milliseconds
+        """
+        self.replay_times.append(replay_time_ms)
+    
+    def check_for_cheat(
+        self,
+        capture_replay_ratio_threshold: float = 10.0,
+        memory_threshold_mb: float = 100.0,
+    ) -> Tuple[bool, Optional[str]]:
+        """Check if the benchmark is cheating via graph capture.
+        
+        Signs of cheating:
+        1. Capture time >> replay time (work done during capture, not replay)
+        2. Large memory allocation during capture
+        3. Replay times are suspiciously fast (near-zero)
+        
+        Args:
+            capture_replay_ratio_threshold: Max allowed ratio of capture/replay time
+            memory_threshold_mb: Memory allocation during capture that triggers warning
+            
+        Returns:
+            Tuple of (is_cheating, reason_if_cheating)
+        """
+        if self.capture_state is None:
+            return False, None
+        
+        warnings_list: List[str] = []
+        
+        # Check 1: Capture/replay time ratio
+        if (self.capture_state.capture_start_time is not None and 
+            self.capture_state.capture_end_time is not None and
+            self.replay_times):
+            
+            capture_time_ms = (
+                self.capture_state.capture_end_time - 
+                self.capture_state.capture_start_time
+            ) * 1000
+            
+            avg_replay_time_ms = sum(self.replay_times) / len(self.replay_times)
+            
+            if avg_replay_time_ms > 0:
+                ratio = capture_time_ms / avg_replay_time_ms
+                if ratio > capture_replay_ratio_threshold:
+                    warnings_list.append(
+                        f"GRAPH CAPTURE CHEAT SUSPECTED: Capture time ({capture_time_ms:.2f}ms) "
+                        f"is {ratio:.1f}x longer than replay time ({avg_replay_time_ms:.2f}ms). "
+                        "This suggests work is being done during capture, not replay."
+                    )
+        
+        # Check 2: Memory allocation during capture
+        if self.capture_state.memory_allocated_during_capture > memory_threshold_mb:
+            warnings_list.append(
+                f"SUSPICIOUS MEMORY ALLOCATION: {self.capture_state.memory_allocated_during_capture:.1f}MB "
+                f"allocated during graph capture. This may indicate computation during capture."
+            )
+        
+        # Check 3: Near-zero replay times
+        if self.replay_times:
+            min_replay = min(self.replay_times)
+            if min_replay < 0.001:  # Less than 1 microsecond
+                warnings_list.append(
+                    f"SUSPICIOUS REPLAY TIME: Minimum replay time ({min_replay*1000:.3f}μs) "
+                    "is near-zero. Graph may be empty or doing no actual work."
+                )
+        
+        # Check 4: High variance across replays (should be stable for real graphs)
+        if len(self.replay_times) >= 3:
+            mean_replay = statistics.mean(self.replay_times)
+            std_replay = statistics.pstdev(self.replay_times)
+            if mean_replay > 0:
+                cv = std_replay / mean_replay
+                if cv > 0.5:
+                    warnings_list.append(
+                        f"REPLAY VARIANCE: Replay times vary too much (CV={cv:.2f}). "
+                        "Real graph replay should be consistent."
+                    )
+        
+        if warnings_list:
+            return True, " | ".join(warnings_list)
+        
+        return False, None
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get capture/replay statistics."""
+        if self.capture_state is None:
+            return {}
+        
+        capture_time_ms = 0.0
+        if (self.capture_state.capture_start_time is not None and 
+            self.capture_state.capture_end_time is not None):
+            capture_time_ms = (
+                self.capture_state.capture_end_time - 
+                self.capture_state.capture_start_time
+            ) * 1000
+        
+        return {
+            "capture_time_ms": capture_time_ms,
+            "capture_memory_mb": self.capture_state.memory_allocated_during_capture,
+            "replay_count": len(self.replay_times),
+            "avg_replay_time_ms": sum(self.replay_times) / len(self.replay_times) if self.replay_times else 0,
+            "min_replay_time_ms": min(self.replay_times) if self.replay_times else 0,
+            "max_replay_time_ms": max(self.replay_times) if self.replay_times else 0,
+        }
+
+
+@contextmanager
+def detect_graph_capture_cheat(device: Optional[Any] = None):
+    """Context manager for graph capture cheat detection.
+    
+    Example:
+        with detect_graph_capture_cheat() as detector:
+            detector.start_capture()
+            with torch.cuda.graph(g):
+                fn()
+            detector.end_capture()
+            
+            for _ in range(10):
+                detector.start_replay()
+                g.replay()
+                # Record replay time manually
+                detector.end_replay(elapsed_ms)
+        
+        is_cheating, reason = detector.check_for_cheat()
+    """
+    detector = GraphCaptureCheatDetector(device)
+    try:
+        yield detector
+    finally:
+        pass  # No cleanup needed
+
+
+def check_graph_capture_integrity(
+    capture_time_ms: float,
+    replay_times_ms: List[float],
+    memory_during_capture_mb: float = 0.0,
+) -> Tuple[bool, Optional[str]]:
+    """Quick check for graph capture integrity without full detector.
+    
+    Args:
+        capture_time_ms: Time to capture the graph
+        replay_times_ms: List of replay iteration times
+        memory_during_capture_mb: Memory allocated during capture
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not replay_times_ms:
+        return True, None
+    
+    avg_replay = sum(replay_times_ms) / len(replay_times_ms)
+    
+    # Check for suspicious capture/replay ratio
+    if avg_replay > 0:
+        ratio = capture_time_ms / avg_replay
+        if ratio > 10.0:
+            return False, (
+                f"Graph capture time ({capture_time_ms:.2f}ms) is {ratio:.1f}x "
+                f"replay time ({avg_replay:.2f}ms). Suspected work during capture."
+            )
+    
+    # Check for near-zero replays
+    if min(replay_times_ms) < 0.001:
+        return False, "Replay times are near-zero, graph may be empty."
+    
+    return True, None
+
+
+# =============================================================================
+# Exports
+# =============================================================================
+
+__all__ = [
+    # GPU State
+    "GPUState",
+    "capture_gpu_state", 
+    "check_gpu_state_consistency",
+    "PrecisionPolicyState",
+    "capture_precision_policy_state",
+    "check_precision_policy_consistency",
+    
+    # Memory Checks
+    "get_tensor_addresses",
+    "check_input_output_aliasing",
+    "reset_cuda_memory_pool",
+    
+    # Memory Allocation Tracking
+    "MemoryAllocationSnapshot",
+    "MemoryAllocationTracker",
+    "track_memory_allocations",
+    
+    # Setup Checks
+    "hash_tensors",
+    "check_setup_precomputation",
+    
+    # GC Control
+    "gc_disabled",
+    
+    # Compile Checks
+    "clear_compile_cache",
+    "get_compile_state",
+    
+    # Lazy Evaluation
+    "force_tensor_evaluation",
+    
+    # Environment
+    "validate_environment",
+    "EnvironmentProbe",
+    "EnvironmentValidationResult",
+    
+    # Stream Auditing
+    "StreamUsageInfo",
+    "StreamAuditor",
+    "audit_streams",
+    "get_active_streams",
+    "check_stream_sync_completeness",
+    
+    # Distributed Verification
+    "DistributedVerifyResult",
+    "gather_rank_outputs",
+    "verify_distributed_outputs",
+    "check_rank_execution",
+    
+    # Graph Capture Cheat Detection
+    "GraphCaptureState",
+    "GraphCaptureCheatDetector",
+    "detect_graph_capture_cheat",
+    "check_graph_capture_integrity",
+]
