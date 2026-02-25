@@ -1,13 +1,3 @@
-// baseline_copy_scalar.cu - Scalar memory copy (Ch7)
-//
-// WHAT: Naive scalar loads - 1 float (4 bytes) per memory operation.
-// Simple memory copy benchmark for comparing scalar vs vectorized.
-//
-// WHY THIS IS SLOWER:
-//   - Each thread issues individual 4-byte loads/stores
-//   - High instruction count per byte transferred
-//   - Does NOT saturate HBM bandwidth
-
 #include "../core/common/headers/cuda_verify.cuh"
 #include "../core/common/nvtx_utils.cuh"
 #include "bench_utils.h"
@@ -19,13 +9,15 @@
 __global__ void copyScalar(const float *__restrict__ in,
                            float *__restrict__ out, int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n) {
-    out[idx] = in[idx]; // 4-byte load, 4-byte store
+  int stride = gridDim.x * blockDim.x;
+  for (int i = idx; i < n; i += stride) {
+    out[i] = in[i]; // 4-byte transactions
   }
 }
 
-void copyScalarBench(nvbench::state &state) {
+void copyScalarHBMBench(nvbench::state &state) {
   const auto num_floats = static_cast<int>(state.get_int64("NumFloats"));
+  const auto grid_size = static_cast<int>(state.get_int64("GridSize"));
   const auto block_size = static_cast<int>(state.get_int64("BlockSize"));
 
   // ---- allocate and initialize ---------------------------------------------
@@ -39,7 +31,7 @@ void copyScalarBench(nvbench::state &state) {
   thrust::device_vector<float> d_out(num_floats);
 
   dim3 block(block_size);
-  dim3 grid((num_floats + block_size - 1) / block_size);
+  dim3 grid(grid_size);
 
   // ---- tell nvbench the memory traffic for bandwidth reporting --------------
   state.add_global_memory_reads<float>(num_floats, "Read");
@@ -59,6 +51,7 @@ void copyScalarBench(nvbench::state &state) {
 #endif
 }
 
-NVBENCH_BENCH(copyScalarBench)
+NVBENCH_BENCH(copyScalarHBMBench)
     .add_int64_axis("NumFloats", {16 << 20, 32 << 20, 64 << 20})
+    .add_int64_axis("GridSize", {1024, 2048})
     .add_int64_axis("BlockSize", {128, 256, 512});
