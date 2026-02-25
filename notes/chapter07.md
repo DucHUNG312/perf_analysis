@@ -1,0 +1,1 @@
+# Chapter 07. Profiling and Tuning GPU Memory Access Patterns
