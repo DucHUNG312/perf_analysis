@@ -261,3 +261,9 @@ eval_datasets/*.json
 node_modules/
 dashboard/web/.next/
 dashboard/web/.turbo/
+
+.cache
+.vscode
+build/
+3rdparty/
+!3rdparty/CMakeLists.txt

@@ -8,11 +8,14 @@
 //   - High instruction count per byte transferred
 //   - Does NOT saturate HBM bandwidth
 
-#include <cstdio>
-#include <cuda_runtime.h>
-
+#include "../core/common/cuda_check.h"
 #include "../core/common/headers/cuda_verify.cuh"
 #include "../core/common/nvtx_utils.cuh"
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <nvbench/nvbench.cuh>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
 
 #define CUDA_CHECK(call)                                                       \
   do {                                                                         \
@@ -24,9 +27,6 @@
     }                                                                          \
   } while (0)
 
-constexpr int NUM_FLOATS = 64 * 1024 * 1024; // 64M floats = 256 MB
-constexpr int BLOCK_SIZE = 256;
-
 // Scalar copy: 1 float per thread
 __global__ void copyScalar(const float *__restrict__ in,
                            float *__restrict__ out, int n) {
@@ -36,85 +36,46 @@ __global__ void copyScalar(const float *__restrict__ in,
   }
 }
 
-int main() {
-  NVTX_RANGE("main");
-  printf("Baseline: Scalar (4-byte) Copy\n");
-  printf("==============================\n");
+void copy_scalar_bench(nvbench::state &state) {
+  const auto num_floats = static_cast<int>(state.get_int64("NumFloats"));
+  const auto block_size = static_cast<int>(state.get_int64("BlockSize"));
 
-  cudaDeviceProp prop;
-  CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-  printf("GPU: %s (SM %d.%d)\n\n", prop.name, prop.major, prop.minor);
-
-  size_t bytes = NUM_FLOATS * sizeof(float);
-  printf("Data size: %zu MB\n", bytes / (1024 * 1024));
-  printf("Total transfer: %zu MB (1 read + 1 write)\n\n",
-         2 * bytes / (1024 * 1024));
-
-  // Allocate
-  float *d_in, *d_out;
-  CUDA_CHECK(cudaMalloc(&d_in, bytes));
-  CUDA_CHECK(cudaMalloc(&d_out, bytes));
-
-  // Initialize
-  float *h_data = new float[NUM_FLOATS];
-  for (int i = 0; i < NUM_FLOATS; ++i) {
-    NVTX_RANGE("setup");
-    h_data[i] = (float)i;
+  // ---- allocate and initialize ---------------------------------------------
+  NVTX_RANGE("initialize");
+  thrust::host_vector<float> h_data(num_floats);
+  for (int i = 0; i < num_floats; ++i) {
+    h_data[i] = static_cast<float>(i);
   }
-  CUDA_CHECK(cudaMemcpy(d_in, h_data, bytes, cudaMemcpyHostToDevice));
 
-  // Setup timing
-  cudaEvent_t start, stop;
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
+  thrust::device_vector<float> d_in(h_data); // H2D copy
+  thrust::device_vector<float> d_out(num_floats);
 
-  dim3 block(BLOCK_SIZE);
-  dim3 grid((NUM_FLOATS + BLOCK_SIZE - 1) / BLOCK_SIZE);
+  dim3 block(block_size);
+  dim3 grid((num_floats + block_size - 1) / block_size);
 
-  // Warmup
-  for (int i = 0; i < 5; ++i) {
-    NVTX_RANGE("warmup");
-    copyScalar<<<grid, block>>>(d_in, d_out, NUM_FLOATS);
-  }
-  CUDA_CHECK(cudaDeviceSynchronize());
+  // ---- tell nvbench the memory traffic for bandwidth reporting --------------
+  state.add_global_memory_reads<float>(num_floats, "Read");
+  state.add_global_memory_writes<float>(num_floats, "Write");
 
-  // Benchmark
-  const int iterations = 20;
-  CUDA_CHECK(cudaEventRecord(start));
-  for (int i = 0; i < iterations; ++i) {
-    NVTX_RANGE("compute_kernel:copyScalar");
-    copyScalar<<<grid, block>>>(d_in, d_out, NUM_FLOATS);
-  }
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaEventSynchronize(stop));
-
-  float ms;
-  CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-  ms /= iterations;
-
-  // Calculate bandwidth (read + write)
-  float bandwidth_gb = (2.0f * bytes) / (ms / 1000.0f) / 1e9f;
-
-  printf("Results:\n");
-  printf("  Time: %.3f ms\n", ms);
-  printf("  Bandwidth: %.1f GB/s\n", bandwidth_gb);
-  printf("TIME_MS: %.6f\n", ms);
+  // ---- benchmark -----------------------------------------------------------
+  NVTX_RANGE("compute_kernel:copyScalar");
+  state.exec([&](nvbench::launch &launch) {
+    copyScalar<<<grid, block, 0, launch.get_stream()>>>(
+        thrust::raw_pointer_cast(d_in.data()),
+        thrust::raw_pointer_cast(d_out.data()), num_floats);
+  });
 
 #ifdef VERIFY
-  float *h_verify = new float[NUM_FLOATS];
-  CUDA_CHECK(cudaMemcpy(h_verify, d_out, bytes, cudaMemcpyDeviceToHost));
+  thrust::host_vector<float> h_verify(d_out); // D2H copy
   float checksum = 0.0f;
-  VERIFY_CHECKSUM(h_verify, NUM_FLOATS, &checksum);
+  VERIFY_CHECKSUM(thrust::raw_pointer_cast(h_verify.data()), num_floats,
+                  &checksum);
   VERIFY_PRINT_CHECKSUM(checksum);
-  delete[] h_verify;
 #endif
-
-  // Cleanup
-  delete[] h_data;
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
-  CUDA_CHECK(cudaFree(d_in));
-  CUDA_CHECK(cudaFree(d_out));
-
-  return 0;
 }
+
+// nvbench runs the full Cartesian product of all axes:
+//   3 NumFloats  x  3 BlockSize  =  9 configurations
+NVBENCH_BENCH(copy_scalar_bench)
+    .add_int64_axis("NumFloats", {16 << 20, 32 << 20, 64 << 20})
+    .add_int64_axis("BlockSize", {128, 256, 512});
